@@ -27,6 +27,7 @@ from duckietown_utils.wrappers.simulator_mod_wrappers import ObstacleSpawningWra
 from duckietown_utils.wrappers.aido_wrapper import AIDOWrapper
 import math
 import copy
+from scipy import stats as st
 
 from gym import envs
 all_envs = envs.registry.all()
@@ -69,7 +70,7 @@ env = Simulator(
 env = AIDOWrapper(env)
 if args.show_observations:
     env = ClipImageWrapper(env, top_margin_divider=3)
-    # env = ResizeWrapper(env, (84, 84))
+# env = ResizeWrapper(env, (84, 84))
 # env = MotionBlurWrapper(env)
 # env = RandomFrameRepeatingWrapper(env, {"frame_repeating": 0.33333})
 # env = ObstacleSpawningWrapper(env, {'obstacles': {'duckie': {'density': 0.35,
@@ -96,18 +97,163 @@ env.reset()
 env.reset()
 env.render(render_mode)
 
+# print('position:',Simulator.cur_pos())
 
+import numpy as np
+import math
+from itertools import product
 
-# # import numpy as np
-# import math
-# import copy
-# from gym_duckietown.simulator import WHEEL_DIST  # Use the true value
+class StochasticPolicyAgentLookAhead:
+    def __init__(self, simulator,num_v=5, num_omega=5, beta=1.0, follow_dist=0.06, max_iterations=1000):
+        """
+        Args:
+            simulator: The simulator object (used for accessing current state and the reference curve).
+            num_v: Number of linear velocity samples.
+            num_omega: Number of angular velocity samples.
+            beta: Temperature parameter for the softmax (higher beta -> more deterministic).
+            follow_dist: Look-ahead distance on the curve.
+            max_iterations: Maximum iterations to search for a valid look-ahead point.
+        """
+        self.simulator = simulator
+        self.num_v = num_v
+        self.num_omega = num_omega
+        self.beta = beta
+        self.follow_dist = follow_dist
+        self.max_iterations = max_iterations
+        # self.q_action = q_action
+        self.WHEEL_DIST = WHEEL_DIST
+
+        # Define a grid for the two-dimensional action space: (v, omega)
+        # For example, let v vary between 0.5 and 1.0 and omega between -0.5 and 0.5.
+        # v_values = np.linspace(0.5, 1.5, num_v)
+        # omega_values = np.linspace(-0.5, 0.5, num_omega)
+        # self.action_space = np.array(list(product(v_values,omega_values)))
+        self.action_space = np.linspace(-1.0, 1.0, num_v)
+
+    def cost_function(self, predicted_state, desired_point, curve_tangent):
+        """
+        Computes the cost of a predicted state relative to the desired point.
+        For simplicity, we use the squared Euclidean distance in the (x, z) position space.
+
+        Args:
+            predicted_state: The predicted next state as [x, z, theta].
+            desired_point: The desired point on the curve as [x, z] or [x, z, theta].
+
+        Returns:
+            A scalar cost.
+        """
+        # Compute a normalized vector to the curve point
+        point_vec = desired_point - predicted_state[:3]
+        point_vec /= np.linalg.norm(point_vec)
+        
+        magic = (curve_tangent + point_vec) / np.linalg.norm(np.linalg.norm(point_vec))
+        e = np.dot(self.get_right_vec(predicted_state[-1]), magic)
+       
+        return e
+
+    def predict_next_state(self, simulator, steering):
+        """
+        Predicts the next state given a candidate action (v, omega) using a simple unicycle model.
+
+        Args:
+            simulator: The simulator object to access the current state.
+            v: Linear velocity.
+            omega: Angular velocity.
+
+        Returns:
+            The predicted next state as a numpy array: [x_next, z_next, theta_next].
+        """
+        left_speed, right_speed =  np.clip(np.array([1 + steering, 1 - steering]), 0., 1.)
+        v = (left_speed + right_speed) / 2
+        omega = (right_speed - left_speed) / (self.WHEEL_DIST)
+        
+        dt = 0.1  # Time step (this can be adjusted or made a parameter)
+        x,_,z = simulator.cur_pos
+        theta = simulator.cur_angle
+
+        # Simple kinematics
+        x_next = x + dt * v * math.cos(theta)
+        z_next = z + dt * v * math.sin(theta)
+        theta_next = theta + dt * omega
+
+        pred_state = np.array([x_next,0.0,z_next,theta_next])      
+        return pred_state
+
+    def step(self, simulator, q_action):
+        """
+        1. Uses a look-ahead along the reference curve to get the desired point.
+        2. For each candidate action, predicts the next state and computes the cost.
+        3. Converts the costs into a probability distribution and samples an action.
+        4. Returns the differential drive commands for that action.
+        """
+        # --- Step 1: Look Ahead on the Curve ---
+        # Get the closest point and its tangent on the reference curve
+    
+        q_pf = st.norm.pdf(q_action,self.action_space,0.08)
+        
+        closest_point, closest_tangent = simulator.closest_curve_point(simulator.cur_pos, simulator.cur_angle)
+
+        # Look ahead along the tangent from the closest point
+        iterations = 0
+        lookup_distance = self.follow_dist
+        desired_point = None
+        desired_tangent = None
+
+        while iterations < self.max_iterations:
+            follow_point = closest_point + closest_tangent * lookup_distance
+            desired_point, desired_tangent = simulator.closest_curve_point(follow_point, simulator.cur_angle)
+            if desired_point is not None:
+                break  # Found a valid desired point
+            iterations += 1
+            lookup_distance *= 0.5
+
+        # If no valid look-ahead point is found, fall back to the closest point.
+        if desired_point is None:
+            desired_point = closest_point
+
+        # --- Step 2: Evaluate Candidate Actions ---
+        costs = []
+        candidate_states = []
+
+        for v in self.action_space:
+            # Predict the next state for action (v, omega)
+            predicted_state = self.predict_next_state(simulator, v)
+            candidate_states.append(predicted_state)
+            # Compute the cost relative to the desired point on the curve
+            cost = self.cost_function(predicted_state, desired_point,desired_tangent)
+            costs.append(cost)
+
+        costs = np.array(costs)
+
+        # --- Step 3: Convert Costs to a Probability Distribution ---
+        # Lower cost should mean higher probability.
+        probabilities = q_pf*np.exp(-self.beta * costs)
+        probabilities /= np.sum(probabilities)
+
+        # Sample one action from the candidate actions using the computed probabilities
+        chosen_index = np.random.choice(len(self.action_space), p=probabilities)
+        chosen_action = self.action_space[chosen_index]
+        steering = chosen_action
+
+        # --- Step 4: Map the (v, omega) Action to Differential Drive Commands ---
+        # For example, one simple mapping is:
+        left_wheel = np.clip(1 + steering, 0., 1.)
+        right_wheel = np.clip(1 - steering, 0., 1.)
+
+        return np.array([left_wheel, right_wheel])
+    
+    @staticmethod
+    def get_right_vec(angle):
+        x = math.sin(angle)
+        z = math.cos(angle)
+        return np.array([x, 0, z])
 
 
 
 class BoltzmannPolicyAgent:
     def __init__(self):
         
+        self.follow_dist = 0.15
         # self.trim = 0.0
         # self.radius = 0.0318
         self.WHEEL_DIST = WHEEL_DIST  # 10.2 cm between wheels (actual value)
@@ -164,7 +310,7 @@ class BoltzmannPolicyAgent:
         
         iterations = 0
 
-        lookup_distance = self.follow_dist
+        lookup_distance = 0.15
         curve_point = None
         while iterations < self.max_iterations:
             # Project a point ahead along the curve tangent,
@@ -218,7 +364,7 @@ class BoltzmannPolicyAgent:
 
 class BaselinePIDAgent:
     def __init__(self):
-        self.follow_dist = 0.15
+        self.follow_dist = 0.06
         self.P = 0.5
         self.D = 5
         # self.trim = 0.0
@@ -266,8 +412,8 @@ class BaselinePIDAgent:
         de = e - self.prev_e
         self.prev_e = e
         steering = self.P * e + self.D * de
-        return np.clip(np.array([1 + steering, 1 - steering]), 0., 1.)
-
+        nsteering = np.clip(steering,-1.0,1.0)
+        return nsteering, np.clip(np.array([1 + steering, 1 - steering]), 0., 1.)
 
     @staticmethod
     def get_right_vec(angle):
@@ -279,7 +425,8 @@ class BaselinePIDAgent:
 # Initialize PID agent
 # After PID agent initialization
 pid_agent = BaselinePIDAgent()
-boltzmann_agent = BoltzmannPolicyAgent()
+# boltzmann_agent = BoltzmannPolicyAgent()
+boltzmann_agent = StochasticPolicyAgentLookAhead(Simulator)
 mode = "manual"  # Can be "manual", "pid", "boltzmann"
 # use_pid_agent = False  # Start in manual mode
 
@@ -347,17 +494,19 @@ def update(dt):
             env.reset()
             
     elif mode == "pid":
-        action = pid_agent.step(env.unwrapped)
+        steering,action = pid_agent.step(env.unwrapped)
         
     elif mode == "boltzmann":
-        action = boltzmann_agent.step(env.unwrapped)
+        steering,q_action = pid_agent.step(env.unwrapped)
+        action = boltzmann_agent.step(env.unwrapped,steering)
 
     obs, reward, done, info = env.step(action)
     if args.show_observations:
         # obs = cv2.resize(obs, (300, 300))
         cv2.imshow("Observation", cv2.cvtColor(obs, cv2.COLOR_BGR2RGB))
         cv2.waitKey(1)
-    print('step_count = %s, reward=%.3f' % (env.unwrapped.step_count, reward))
+    print('obs:',env.unwrapped.cur_pos)
+    # print('step_count = %s, obs=%.3f' % (env.unwrapped.step_count, obs))
 
     if key_handler[key.RETURN]:
         from PIL import Image
